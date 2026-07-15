@@ -1,0 +1,22 @@
+# Dependencies (if utilizing local vendor caching)
+# Uncomment the line below if you run 'go mod vendor' but want clean Docker downloads
+# vendor/
+
+# Environment secrets and local configurations
+.env
+*.env
+.env.*
+secrets/
+
+# IDE and Editor configurations
+.idea/
+.vscode/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.swp
+*~
+
+# Operating system metadata
+.DS_Store

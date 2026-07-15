@@ -1,0 +1,14 @@
+service:
+  webmail-rmq-worker:
+    build:
+      context: .
+      dockerfile: Dokcerfile
+    container_name: webmail-rmq-worker
+
+    env_file: 
+      - .env
+
+    volumes:
+      - ./logs:/app/logs
+
+    restart: always
