@@ -167,11 +167,9 @@ The worker connects to RabbitMQ, declares the queues (if needed), and begins con
 
 ### Docker
 
-Build and run the image:
+Run the image:
 
 ```bash
-docker build -f Dokcerfile -t webmail-rmq-worker .
-
 docker run --rm \
   --env-file .env \
   webmail-rmq-worker
@@ -182,13 +180,13 @@ docker run --rm \
 A `docker-compose.yml` is included for local orchestration with RabbitMQ:
 
 ```bash
-docker compose up --build
+docker compose up
 ```
 
 To run in the background:
 
 ```bash
-docker compose up -d --build
+docker compose up -d
 ```
 
 ---

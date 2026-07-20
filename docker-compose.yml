@@ -1,9 +1,7 @@
 service:
-  webmail-rmq-worker:
-    build:
-      context: .
-      dockerfile: Dokcerfile
-    container_name: webmail-rmq-worker
+  webmail-worker-rmq:
+    image: rjyspl/webmail-worker-rmq:latest
+    container_name: webmail-worker-rmq
 
     env_file: 
       - .env
