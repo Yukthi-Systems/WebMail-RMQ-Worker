@@ -72,6 +72,7 @@ func (s *EmailService) ProcessMail(
 		Bool("draft_saved", p.DraftSaved).
 		Str("draft_folder", p.DraftFolderName).
 		Str("draft_message_id", p.DraftMessageID).
+		Bool("read_receipt", p.ReadReceipt).
 		Msg("New email job received. Starting to process.")
 
 	raw, err := BuildEmail(p)

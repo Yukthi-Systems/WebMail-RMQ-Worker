@@ -22,6 +22,7 @@ import (
 	"encoding/base64"
 	"fmt"
 	"net/http"
+	"net/mail"
 
 	"strings"
 	"time"
@@ -63,6 +64,13 @@ func BuildEmail(p *models.EmailPayload) ([]byte, error) {
 
 	for key, value := range p.Headers {
 		b = b.Header(key, value)
+	}
+
+	// Request a read receipt (Message Disposition Notification) the same way
+	// Roundcube does: add a Disposition-Notification-To header pointing back
+	// at the sender. Recipients' mail clients decide whether to honor it.
+	if p.ReadReceipt {
+		b = b.Header("Disposition-Notification-To", (&mail.Address{Name: p.From.Name, Address: p.From.Address}).String())
 	}
 
 	// Add recipients
