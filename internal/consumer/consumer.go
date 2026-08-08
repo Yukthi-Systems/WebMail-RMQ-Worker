@@ -16,17 +16,18 @@ version 3 along with this program. If not, see
 */
 
 // Package consumer implements the RabbitMQ message consumer.
-// It declares the required queues, starts a configurable pool of goroutine
-// workers, and dispatches each delivery to the email service for processing.
-// Failed deliveries are published to the configured dead-letter queue (DLQ)
-// with an explanatory header before the original message is acknowledged.
+// It declares the required queues, consumes with a configurable pool of
+// concurrent handler goroutines (managed by go-rabbitmq, which also handles
+// reconnection transparently), and dispatches each delivery to the email
+// service for processing. Failed deliveries are published to the configured
+// dead-letter queue (DLQ) with an explanatory header before the original
+// message is acknowledged.
 package consumer
 
 import (
 	"context"
 	"encoding/json"
 	"fmt"
-
 	"time"
 
 	"github.com/Yukthi-Systems/WebMail-RMQ-Worker/internal/config"
@@ -35,30 +36,32 @@ import (
 	"github.com/Yukthi-Systems/WebMail-RMQ-Worker/pkg/logger"
 	"github.com/Yukthi-Systems/WebMail-RMQ-Worker/pkg/rabbit"
 
-	amqp "github.com/streadway/amqp"
+	amqp "github.com/rabbitmq/amqp091-go"
+	rabbitmq "github.com/wagslane/go-rabbitmq"
 )
 
 // Consumer ties together a RabbitMQ [rabbit.Connection] and the
 // [email.EmailService] into a concurrent message-processing pipeline.
-// Create one with [NewConsumer] and start it with [Consumer.Start].
+// Create one with [NewConsumer], wire it up with [Consumer.Start], then
+// block on [Consumer.Run] until [Consumer.Stop] is called (typically from a
+// signal handler).
 type Consumer struct {
-	conn   *rabbit.Connection
-	svc    *email.EmailService
-	ctx    context.Context
-	cancel context.CancelFunc
+	conn     *rabbit.Connection
+	svc      *email.EmailService
+	consumer *rabbitmq.Consumer
 }
 
-// NewConsumer creates a Consumer with a cancellable context derived from
-// context.Background. Call [Consumer.Start] to begin consuming messages.
+// NewConsumer creates a Consumer. Call [Consumer.Start] to declare queues
+// and register the underlying RabbitMQ consumer, then [Consumer.Run] to
+// begin processing messages.
 func NewConsumer(conn *rabbit.Connection, svc *email.EmailService) *Consumer {
-	ctx, cancel := context.WithCancel(context.Background())
-	return &Consumer{conn: conn, svc: svc, ctx: ctx, cancel: cancel}
+	return &Consumer{conn: conn, svc: svc}
 }
 
-// Start declares the main and dead-letter queues (if not already present),
-// registers the consumer on the main queue, and launches [Config.WorkerCount]
-// goroutines to process incoming deliveries concurrently.
-// It returns an error if queue declaration or consumer registration fails.
+// Start declares the main and dead-letter queues (if not already present)
+// and registers a RabbitMQ consumer on the main queue with
+// [Config.WorkerCount] concurrent handler goroutines. It returns an error if
+// queue declaration or consumer registration fails.
 func (c *Consumer) Start() error {
 	if err := c.conn.DeclareQueues(
 		config.Cfg.RabbitMainQueue,
@@ -70,86 +73,81 @@ func (c *Consumer) Start() error {
 			err,
 		)
 	}
-	msgs, err := c.conn.Consume(
+
+	rc, err := c.conn.NewConsumer(
 		config.Cfg.RabbitMainQueue,
-		config.Cfg.ConsumerTag)
+		config.Cfg.ConsumerTag,
+		config.Cfg.WorkerCount,
+		config.Cfg.RabbitPrefetch,
+	)
 	if err != nil {
 		return err
 	}
+	c.consumer = rc
 
-	// Start worker pool
-	for i := range config.Cfg.WorkerCount {
-		go c.worker(i, msgs)
-	}
 	return nil
 }
 
-func (c *Consumer) worker(id int, msgs <-chan amqp.Delivery) {
+// Run begins consuming messages and blocks until [Consumer.Stop] is called
+// (go-rabbitmq reconnects transparently in the background in the meantime).
+// Call it after [Consumer.Start] has succeeded.
+func (c *Consumer) Run() error {
 	logger.Info().
-		Int("worker_id", id).
-		Msg("Email worker started and ready to process jobs.")
-	for {
-		select {
-		case <-c.ctx.Done():
-			logger.Info().
-				Int("worker_id", id).
-				Msg("Worker received a stop signal and is shutting down.")
-			return
-		case d, ok := <-msgs:
-			if !ok {
-				logger.Info().
-					Int("worker_id", id).
-					Msg("Message channel was closed by the broker. Worker is stopping.")
-				return
-			}
-			// handle with timeout to avoid stuck processing
-			ctx, cancel := context.WithTimeout(c.ctx, 60*time.Second)
-			err := c.handleDelivery(ctx, d)
-			cancel()
-			if err != nil {
-				// Error: the email job failed. It will be moved to the dead-letter queue for inspection.
-				logger.Error().
-					Int("worker_id", id).
-					Str("queue_msg_id", d.Headers["queue_msg_id"].(string)).
-					Err(err).
-					Msg("Email job failed. Moving the message to the dead-letter queue for manual review.")
-
-				// add custom dead-letter reason
-				headers := d.Headers
-				if headers == nil {
-					headers = amqp.Table{}
-				}
-				headers["x-dead-letter-reason"] = fmt.Sprintf("email processing. %v", err)
-
-				// republish manually to dead queue
-				err = c.conn.PublishToDLQ(config.Cfg.RabbitDeadQueue, d.Body, headers)
-				if err != nil {
-					// Error: the failed job could not even be moved to the dead-letter queue.
-					// This message may be lost. Investigate RabbitMQ connectivity.
-					logger.Error().
-						Int("worker_id", id).
-						Str("queue_msg_id", d.Headers["queue_msg_id"].(string)).
-						Err(err).
-						Msg("Could not move the failed job to the dead-letter queue.")
-				}
-				_ = c.conn.Ack(d) // acknowledge original message
-			} else {
-				_ = c.conn.Ack(d) // No issue all success
-			}
-		}
-	}
+		Int("worker_count", config.Cfg.WorkerCount).
+		Msg("Email worker pool started and ready to process jobs.")
+	return c.consumer.Run(c.handle)
 }
 
-func (c *Consumer) handleDelivery(ctx context.Context, d amqp.Delivery) error {
-	queue_msg_id := d.Headers["queue_msg_id"].(string)
+// Stop gracefully stops the consumer, waiting for any in-flight job to
+// finish before returning. Call it once, typically from a signal handler
+// running concurrently with [Consumer.Run].
+func (c *Consumer) Stop() {
+	c.consumer.Close()
+}
+
+func (c *Consumer) handle(d rabbitmq.Delivery) rabbitmq.Action {
+	queueMsgID := d.Headers["queue_msg_id"].(string)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	if err := c.handleDelivery(ctx, d, queueMsgID); err != nil {
+		// Error: the email job failed. It will be moved to the dead-letter queue for inspection.
+		logger.Error().
+			Str("queue_msg_id", queueMsgID).
+			Err(err).
+			Msg("Email job failed. Moving the message to the dead-letter queue for manual review.")
+
+		// add custom dead-letter reason
+		headers := d.Headers
+		if headers == nil {
+			headers = amqp.Table{}
+		}
+		headers["x-dead-letter-reason"] = fmt.Sprintf("email processing. %v", err)
+
+		// republish manually to dead queue
+		if err := c.conn.PublishToDLQ(config.Cfg.RabbitDeadQueue, d.Body, rabbitmq.Table(headers)); err != nil {
+			// Error: the failed job could not even be moved to the dead-letter queue.
+			// This message may be lost. Investigate RabbitMQ connectivity.
+			logger.Error().
+				Str("queue_msg_id", queueMsgID).
+				Err(err).
+				Msg("Could not move the failed job to the dead-letter queue.")
+		}
+	}
+
+	return rabbitmq.Ack // acknowledge original message either way
+}
+
+func (c *Consumer) handleDelivery(ctx context.Context, d rabbitmq.Delivery, queueMsgID string) error {
 	var p models.EmailPayload
 	if err := json.Unmarshal(d.Body, &p); err != nil {
 		// Error: the message body is not valid JSON. This is likely a publisher bug.
 		logger.Error().
 			Err(err).
-			Str("queue_msg_id", queue_msg_id).
+			Str("queue_msg_id", queueMsgID).
 			Msg("Received a message with invalid JSON format. Cannot process this job.")
 		return err
 	}
-	return c.svc.ProcessMail(ctx, &p, queue_msg_id)
+	return c.svc.ProcessMail(ctx, &p, queueMsgID)
 }
