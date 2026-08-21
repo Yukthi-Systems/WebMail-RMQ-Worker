@@ -23,7 +23,6 @@ import (
 	"os/signal"
 
 	"syscall"
-	"time"
 
 	"github.com/Yukthi-Systems/WebMail-RMQ-Worker/internal/config"
 	"github.com/Yukthi-Systems/WebMail-RMQ-Worker/internal/consumer"
@@ -54,7 +53,7 @@ func main() {
 		config.Cfg.RabbitPort,
 		config.Cfg.RabbitVHost,
 	)
-	conn, err := rabbit.NewConnection(rabbitURL, config.Cfg.RabbitPrefetch)
+	conn, err := rabbit.NewConnection(rabbitURL)
 	if err != nil {
 		// Fatal: cannot start without a broker connection.
 		logger.
@@ -79,16 +78,24 @@ func main() {
 	}
 	logger.Info().Msg("Worker is running and waiting for email jobs on the queue.")
 
-	// Wait for termination signal
+	// Stop the consumer on a termination signal; Run below unblocks once
+	// Stop has waited for any in-flight job to finish.
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
-	<-sig
+	go func() {
+		<-sig
+		logger.
+			Info().
+			Msg("Shutdown signal received. Finishing any in-flight jobs and closing connections...")
+		cons.Stop()
+	}()
 
-	logger.
-		Info().
-		Msg("Shutdown signal received. Finishing any in-flight jobs and closing connections...")
-	// Give in-flight workers up to 1 second to finish.
-	time.Sleep(1 * time.Second)
+	if err := cons.Run(); err != nil {
+		logger.
+			Error().
+			Err(err).
+			Msg("Email consumer stopped with an error.")
+	}
 	logger.
 		Info().
 		Msg("Worker shut down cleanly. Goodbye.")

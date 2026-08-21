@@ -15,52 +15,78 @@ version 3 along with this program. If not, see
 <https://www.gnu.org/licenses/>.
 */
 
-// Package rabbit provides a thin wrapper around the AMQP 0-9-1 client
-// ([streadway/amqp]) for connecting to RabbitMQ, declaring queues, consuming
-// messages, acknowledging deliveries, and publishing to a dead-letter queue.
+// Package rabbit provides a thin wrapper around [github.com/wagslane/go-rabbitmq]
+// for connecting to RabbitMQ with automatic reconnect, declaring queues,
+// consuming messages, and publishing to a dead-letter queue.
 package rabbit
 
 import (
 	"fmt"
 
-	"github.com/streadway/amqp"
+	amqp "github.com/rabbitmq/amqp091-go"
+	rabbitmq "github.com/wagslane/go-rabbitmq"
 )
 
-// Connection wraps an AMQP connection and a single channel.
-// Create one with [NewConnection]; call [Connection.Close] when done.
+// Connection wraps a reconnecting [rabbitmq.Conn], shared between the
+// consumer created via [Connection.NewConsumer] and a [rabbitmq.Publisher]
+// used to dead-letter failed jobs. Create one with [NewConnection]; call
+// [Connection.Close] when done.
 type Connection struct {
-	URL  string
-	conn *amqp.Connection
-	ch   *amqp.Channel
+	URL       string
+	conn      *rabbitmq.Conn
+	publisher *rabbitmq.Publisher
 }
 
-// NewConnection dials the given AMQP URL, opens a channel, and sets the
-// channel-level QoS prefetch count to preFetch. Both the connection and the
-// channel are stored in the returned [Connection].
-// Returns an error if the dial or channel open fails.
-func NewConnection(amqpURL string, preFetch int) (*Connection, error) {
-	conn, err := amqp.Dial(amqpURL)
+// NewConnection dials the given AMQP URL through go-rabbitmq. The returned
+// connection reconnects automatically on connection loss; consumers and
+// publishers created from it recover their channels, queues, and
+// subscriptions transparently. A [rabbitmq.Publisher] used by
+// [Connection.PublishToDLQ] is opened on the same connection.
+func NewConnection(amqpURL string) (*Connection, error) {
+	conn, err := rabbitmq.NewConn(
+		amqpURL,
+		rabbitmq.WithConnectionOptionsLogger(rmqLogger{}),
+	)
 	if err != nil {
-		return nil, err
-	}
-	ch, err := conn.Channel()
-	if err != nil {
-		conn.Close()
 		return nil, err
 	}
 
-	_ = ch.Qos(preFetch, 0, false)
-	return &Connection{URL: amqpURL, conn: conn, ch: ch}, nil
+	publisher, err := rabbitmq.NewPublisher(
+		conn,
+		rabbitmq.WithPublisherOptionsLogger(rmqLogger{}),
+	)
+	if err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+
+	return &Connection{URL: amqpURL, conn: conn, publisher: publisher}, nil
 }
 
 // DeclareQueues ensures both the dead-letter queue and the main work queue
-// exist on the broker. The dead queue is declared as a plain durable queue.
-// The main queue is declared passively first; if it does not yet exist it is
-// created as durable with the dead-letter exchange configured to route
-// rejected messages to deadQueue.
+// exist on the broker. Declaration happens over a short-lived, non-reconnecting
+// channel: go-rabbitmq's reconnecting [rabbitmq.Conn] only declares a
+// consumer's own queue (see [Connection.NewConsumer]), so the DLQ - which
+// nothing consumes from directly - has nowhere else to be declared.
+//
+// The dead queue is declared as a plain durable queue. The main queue is
+// declared passively first; if it does not yet exist it is created as
+// durable with the dead-letter exchange configured to route rejected
+// messages to deadQueue.
 func (c *Connection) DeclareQueues(mainQueue, deadQueue string) error {
+	rawConn, err := amqp.Dial(c.URL)
+	if err != nil {
+		return fmt.Errorf("dial for queue declaration: %w", err)
+	}
+	defer rawConn.Close()
 
-	if _, err := c.ch.QueueDeclare(
+	ch, err := rawConn.Channel()
+	if err != nil {
+		return fmt.Errorf("open channel for queue declaration: %w", err)
+	}
+	defer ch.Close()
+
+	if _, err := ch.QueueDeclare(
 		deadQueue,
 		true,  // durable
 		false, // auto-delete
@@ -71,7 +97,14 @@ func (c *Connection) DeclareQueues(mainQueue, deadQueue string) error {
 		return fmt.Errorf("there is an issue with the dead queue declaration: %w", err)
 	}
 
-	_, err := c.ch.QueueDeclarePassive(mainQueue, true, false, false, false, nil)
+	// A failed passive declare closes the channel it was issued on, so this
+	// probe runs on its own channel to leave ch usable afterwards.
+	probeCh, err := rawConn.Channel()
+	if err != nil {
+		return fmt.Errorf("open channel for main queue check: %w", err)
+	}
+	_, err = probeCh.QueueDeclarePassive(mainQueue, true, false, false, false, nil)
+	_ = probeCh.Close()
 	if err == nil {
 		return nil
 	}
@@ -81,7 +114,7 @@ func (c *Connection) DeclareQueues(mainQueue, deadQueue string) error {
 		"x-dead-letter-routing-key": deadQueue,
 	}
 
-	if _, err := c.ch.QueueDeclare(
+	if _, err := ch.QueueDeclare(
 		mainQueue,
 		true,  // durable
 		false, // auto-delete
@@ -95,63 +128,42 @@ func (c *Connection) DeclareQueues(mainQueue, deadQueue string) error {
 	return nil
 }
 
-// Consume registers a consumer on the given queue and returns a read-only
-// channel of AMQP deliveries. Auto-acknowledge is disabled; the caller must
-// explicitly Ack or Nack each delivery.
-func (c *Connection) Consume(queue string, consumer string) (<-chan amqp.Delivery, error) {
-	msgs, err := c.ch.Consume(
+// NewConsumer creates a [rabbitmq.Consumer] on queue, using consumerTag as
+// the AMQP consumer identifier, concurrency goroutines to process
+// deliveries in parallel, and prefetch as the channel's QoS prefetch count.
+// The queue is assumed to already exist (see [Connection.DeclareQueues]) and
+// is not redeclared.
+func (c *Connection) NewConsumer(queue, consumerTag string, concurrency, prefetch int) (*rabbitmq.Consumer, error) {
+	return rabbitmq.NewConsumer(
+		c.conn,
 		queue,
-		consumer,
-		false, // autoAck
-		false, // exclusive
-		false, // noLocal
-		false, // noWait
-		nil,
+		rabbitmq.WithConsumerOptionsConsumerName(consumerTag),
+		rabbitmq.WithConsumerOptionsConcurrency(concurrency),
+		rabbitmq.WithConsumerOptionsQOSPrefetch(prefetch),
+		rabbitmq.WithConsumerOptionsQueueNoDeclare,
+		rabbitmq.WithConsumerOptionsLogger(rmqLogger{}),
 	)
-	if err != nil {
-		return nil, err
-	}
-	return msgs, nil
-}
-
-// Ack acknowledges a single delivery, signalling that it was processed
-// successfully and can be removed from the queue.
-func (c *Connection) Ack(d amqp.Delivery) error {
-	return d.Ack(false)
-}
-
-// Nack negatively acknowledges a delivery. When requeue is true the broker
-// will re-enqueue the message; when false it is discarded or routed to the
-// dead-letter queue according to the broker configuration.
-func (c *Connection) Nack(d amqp.Delivery, requeue bool) error {
-	return d.Nack(false, requeue)
-}
-
-// Close gracefully shuts down the channel and connection.
-// It is safe to call Close more than once.
-func (c *Connection) Close() {
-	if c.ch != nil {
-		_ = c.ch.Close()
-	}
-	if c.conn != nil {
-		_ = c.conn.Close()
-	}
 }
 
 // PublishToDLQ publishes a message body directly to the named dead-letter
 // queue on the default exchange, attaching the provided headers. This is used
 // to manually route a failed delivery to the DLQ while preserving diagnostic
 // metadata such as the failure reason.
-func (c *Connection) PublishToDLQ(queue string, body []byte, headers amqp.Table) error {
-	return c.ch.Publish(
-		"",    // default exchange
-		queue, // DLQ name
-		false,
-		false,
-		amqp.Publishing{
-			ContentType: "application/json",
-			Body:        body,
-			Headers:     headers,
-		},
+func (c *Connection) PublishToDLQ(queue string, body []byte, headers rabbitmq.Table) error {
+	return c.publisher.Publish(
+		body,
+		[]string{queue},
+		rabbitmq.WithPublishOptionsContentType("application/json"),
+		rabbitmq.WithPublishOptionsHeaders(headers),
 	)
+}
+
+// Close gracefully shuts down the publisher and the underlying connection.
+func (c *Connection) Close() {
+	if c.publisher != nil {
+		c.publisher.Close()
+	}
+	if c.conn != nil {
+		_ = c.conn.Close()
+	}
 }

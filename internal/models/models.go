@@ -108,4 +108,5 @@ type EmailPayload struct {
 	DraftSaved        bool               `json:"draft_saved"`                   // True if a previous draft exists and should be removed after sending.
 	DraftFolderName   string             `json:"draft_folder_name,omitempty"`   // IMAP folder containing the existing draft.
 	DraftMessageID    string             `json:"draft_message_id,omitempty"`    // Message-ID of the existing draft to delete.
+	ReadReceipt       bool               `json:"read_receipt,omitempty"`        // True to request a read receipt from recipients.
 }
